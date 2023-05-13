@@ -11,6 +11,7 @@ import warnings
 from abc import ABC, abstractmethod  # noqa: F401
 from enum import IntFlag
 from functools import reduce
+from typing import List, Optional, Set, Tuple, Union
 
 import onnx
 import torch
@@ -23,6 +24,7 @@ from onnxruntime.training import ortmodule
 
 from . import _are_deterministic_algorithms_enabled, _io, _logger, _onnx_models, _runtime_inspector, _utils
 from ._custom_autograd_function_exporter import _post_process_after_export
+from ._execution_agent import InferenceAgent, TrainingAgent
 from ._fallback import (
     ORTModuleDeviceException,
     ORTModuleONNXModelException,
@@ -30,20 +32,20 @@ from ._fallback import (
     _FallbackManager,
     wrap_exception,
 )
-from ._gradient_accumulation_manager import GradientAccumulationManager
 from ._graph_execution_interface import GraphExecutionInterface
+from ._io import _FlattenedModule, _InputInfo, _ModelInputOutputSchemaType
 from .debug_options import DebugOptions, LogLevel
 from .torch_cpp_extensions.cpu.aten_op_executor import load_aten_op_executor_cpp_extension
 
 
 class _RunStateInfo:
-    def __init__(self, state, output_info):
+    def __init__(self, state, output_info: List[Tuple[torch.Size, torch.device, torch.dtype]]):
         """
         :param state: State of partial run that contains intermediate tensors needed to resume the run later.
         :param output_info: Output info.
         """
         self.state = state
-        self.output_info = output_info
+        self.output_info: List[Tuple[torch.Size, torch.device, torch.dtype]] = output_info
 
 
 class _SkipCheck(IntFlag):
@@ -69,27 +71,27 @@ class _SkipCheck(IntFlag):
 
 
 class GraphExecutionManager(GraphExecutionInterface):
-    def __init__(self, module, debug_options: DebugOptions, fallback_manager: _FallbackManager):
+    def __init__(self, module: _FlattenedModule, debug_options: DebugOptions, fallback_manager: _FallbackManager):
         """Manages construction and execution of ONNX graphs"""
 
         super().__init__(module._original_module)
 
         # IMPORTANT: Debug and Fallback must the configured first
-        self._debug_options = debug_options
-        self._fallback_manager = fallback_manager
+        self._debug_options: DebugOptions = debug_options
+        self._fallback_manager: _FallbackManager = fallback_manager
 
         # Original and flattened (transformed) output module
-        self._flattened_module = module
+        self._flattened_module: _FlattenedModule = module
 
         # onnx models
         self._onnx_models = _onnx_models.ONNXModels()
 
         # Model after inference optimization or gradient building.
-        self._graph_builder = None
-        self._graph_info = None
-        self._graph_initializer_names = None
-        self._graph_initializer_names_to_train = None
-        self._graph_initializers = None
+        self._graph_builder: Optional[C.OrtModuleGraphBuilder] = None
+        self._graph_info: Optional[C.GraphInfo] = None
+        self._graph_initializer_names: Set[str] = set()
+        self._graph_initializer_names_to_train: Set[str] = set()
+        self._graph_initializers: List[torch.nn.parameter.Parameter] = []
 
         # Update constant ONNX_OPSET_VERSION with env var ORTMODULE_ONNX_OPSET_VERSION
         # if defined.
@@ -98,9 +100,9 @@ class GraphExecutionManager(GraphExecutionInterface):
         )
 
         # TrainingAgent or InferenceAgent
-        self._execution_agent = None
+        self._execution_agent: Optional[Union[InferenceAgent, TrainingAgent]] = None
 
-        # indicators of some logic have been executed previously and thus could be skipped for faster training
+        # Indicators of some logic have been executed previously and thus could be skipped for faster training
         # default is enabled, if not defined in os env
         self._skip_check = _SkipCheck(
             _SkipCheck.SKIP_CHECK_DEVICE | _SkipCheck.SKIP_CHECK_BUILD_GRADIENT | _SkipCheck.SKIP_CHECK_EXECUTION_AGENT
@@ -110,7 +112,7 @@ class GraphExecutionManager(GraphExecutionInterface):
                 lambda x, y: x | y,
                 [_SkipCheck[name] for name in _utils.parse_os_env_skip_check_flags("ORTMODULE_SKIPCHECK_POLICY")],
             )
-        self._first_skip_check_warning = True
+        self._first_skip_check_warning: bool = True
 
         # Inspect embedding input index sparsity.
         self._rt_inspector = _runtime_inspector.RuntimeInspector()
@@ -118,7 +120,7 @@ class GraphExecutionManager(GraphExecutionInterface):
         # Graph transformer config
         # Specify cast propagation strategy. Currently, three strategies are available, NONE, INSERT-AND-REDUCE and FLOOD-FILL
         # The default is FLOOD_FILL, expand FP16 computation regions in the graph using allowed opcodes for the given level.
-        self._propagate_cast_ops_strategy = C.PropagateCastOpsStrategy.FLOOD_FILL
+        self._propagate_cast_ops_strategy: int = C.PropagateCastOpsStrategy.FLOOD_FILL
         # Optimize by moving Cast operations if propagate_cast_ops_level is non-negative.
         # - If the _propagate_cast_ops_level is set to zero, then the transformation considers only the opcodes specified by _propagate_cast_ops_allow
         #   as "FP16 safe", to insert/(re)move cast operations before/after to perform such operations in reduced (16-bit) precision.
@@ -127,37 +129,41 @@ class GraphExecutionManager(GraphExecutionInterface):
         # - Onnxruntime Level 1 predetermined "FP16 safe" opcodes include only opcodes that do not perform any computation such as Transpose, Split, Reshape, etc.,
         #   or the computation is actually in Float such as GeLU, etc.
         #   whereas Level 2 predetermined "FP16 safe" opcodes include opcodes that perform computation using contrib ops, Dropout, LayerNormalization, etc.
-        self._propagate_cast_ops_level = 1
+        self._propagate_cast_ops_level: int = 1
         # List of opcodes to be considered safe to move before/after the cast operation if propagate_cast_ops_level is zero.
-        self._propagate_cast_ops_allow = []
+        self._propagate_cast_ops_allow: List[str] = []
 
         # Value can be either torch.onnx.TrainingMode.TRAINING or torch.onnx.TrainingMode.EVAL
         # To be instantiated in the concrete implementation of GraphExecutionManager
-        self._export_mode = None
+        self._export_mode: Optional[int] = None
 
         # Exporter can take extra arguments for ORTModule extensions
         # It cannot overlap with required/immutable arguments (validated in runtime)
         self._export_extra_kwargs = {}
 
-        # Related to training graph shape inference
-        self._current_input_shape = None
         # default execution order is priority-based for both dynamic/static shape input for now
         # if we observe the benefit of static shape, we can expose this flag to the user
-        self._use_static_shape = False
+        self._use_static_shape: bool = False
 
         # flag to enable symbolic shape inference for dynamic shape inputs to improve performance
-        self._run_symbolic_shape_infer = True
+        self._run_symbolic_shape_infer: bool = True
 
         # PyTorch custom Autograd function support
         from ._custom_autograd_function import custom_autograd_function_enabler
 
-        self._enable_custom_autograd_function = custom_autograd_function_enabler.state
+        self._enable_custom_autograd_function: bool = custom_autograd_function_enabler.state
 
-        self._input_info = None
-        self._module_output_schema = None
-        self._device = _utils.get_device_from_module(module)
+        # Input and output infos (including schema) for exported model.
+        self._input_info: Optional[_InputInfo] = None
+        self._module_output_schema: Optional[_ModelInputOutputSchemaType] = None
 
-        self._module_parameters = list(inspect.signature(self._original_module.forward).parameters.values())
+        # Device where the model is placed.
+        self._device: Optional[torch.device] = _utils.get_device_from_module(module)
+
+        # Forward function input parameters of the original module.
+        self._module_parameters: List[inspect.Parameter] = list(
+            inspect.signature(self._original_module.forward).parameters.values()
+        )
 
         # TODO: remove after PyTorch ONNX exporter supports VAR_KEYWORD parameters.
         for input_parameter in self._module_parameters:
@@ -167,32 +173,28 @@ class GraphExecutionManager(GraphExecutionInterface):
                         "The model's forward method has **kwargs parameter which has EXPERIMENTAL support!", UserWarning
                     )
 
-        self.is_rocm_pytorch = bool(torch.version.hip is not None and ROCM_HOME is not None)
+        self.is_rocm_pytorch: bool = bool(torch.version.hip is not None and ROCM_HOME is not None)
 
-        self._use_external_gpu_allocator = True
+        self._use_external_gpu_allocator: bool = True
         # assign self._torch_alloc and self._torch_free if self._use_external_gpu_allocator is True
         self._get_torch_gpu_allocator_function_addresses()
 
-        # WIP feature to enable caching in Gradient accumulation scenario.
-        self._enable_grad_acc_optimization = False
-        self._gradient_accumulation_manager = GradientAccumulationManager()
-
         # Memory-aware gradient builder.
-        self._use_memory_efficient_gradient = False
+        self._use_memory_efficient_gradient: bool = False
 
         # Enable compute optimizer by default. Allowed to be disabled via an environment variable for
         # convergence parity investigation.
-        self._enable_compute_optimizer = (
+        self._enable_compute_optimizer: bool = (
             ortmodule._defined_from_envvar("ORTMODULE_ENABLE_COMPUTE_OPTIMIZER", 1, warn=True) == 1
         )
-        self._enable_label_sparsity_optimization = (
+        self._enable_label_sparsity_optimization: bool = (
             self._enable_compute_optimizer
             and ortmodule._defined_from_envvar("ORTMODULE_ENABLE_LABEL_SPARSITY_OPT", 0, warn=True) == 1
         )
 
         # Flag to re-export the model due to attribute change on the original module.
         # Re-export will be avoided if _skip_check is enabled.
-        self._original_model_has_changed = False
+        self._original_model_has_changed: bool = False
 
         # Load ATen operator executor extension.
         load_aten_op_executor_cpp_extension()
@@ -225,26 +227,6 @@ class GraphExecutionManager(GraphExecutionInterface):
                 ),
             )
 
-    @staticmethod
-    def execution_session_run_forward(execution_session, onnx_model, device, *inputs):
-        """Runs the forward pass on `execution_session` with given `onnx_model`, `device` and `inputs`
-
-        This is a helper that can be called by the actual `GraphExecutionManager.forward` method
-
-        Args:
-            execution_session (InferenceAgent or InferenceAgent): Agent which runs either inference or train
-            onnx_model (onnx.ModelProto): ONNX model
-            device (torch.device): PyTorch device
-            inputs: (torch.Tensor or a container of): User input
-
-        Returns:
-            Returns a tuple (user_outputs, run_info):
-            user_outputs: The model output (either torch.Tensor or a container of torch.Tensor)
-            run_info: A _RunStateInfo which contains extra information about the execution of the graph
-        """
-
-        raise NotImplementedError
-
     @abstractmethod
     def forward(self):
         """Executes the forward method for ORTModule
@@ -254,7 +236,7 @@ class GraphExecutionManager(GraphExecutionInterface):
         All other methods are internal"""
         pass
 
-    def _build_graph(self):
+    def _build_graph(self) -> None:
         if self._use_static_shape:
             self._graph_builder.build(self._input_info.shape)
         else:
@@ -327,7 +309,7 @@ class GraphExecutionManager(GraphExecutionInterface):
 
         return session_options, providers, provider_options
 
-    def _export_model(self, *inputs, **kwargs):
+    def _export_model(self, *inputs, **kwargs) -> bool:
         # 1. Set the self._device from the user module
         # 2. Verify input schema matches the schema used on the previous model export
         # 3. Export the user model under self._export_training_flag mode
@@ -371,8 +353,9 @@ class GraphExecutionManager(GraphExecutionInterface):
 
         return True
 
-    def _get_exported_model(self, input_schema, *inputs, **kwargs):
-        """Exports PyTorch `self._flattened_module` to ONNX for inferencing or training, using `*inputs` and `**kwargs` as input
+    def _get_exported_model(self, input_schema: _ModelInputOutputSchemaType, *inputs, **kwargs) -> onnx.ModelProto:
+        """Exports PyTorch `self._flattened_module` to ONNX for inferencing or training,
+          using `*inputs` and `**kwargs` as input
 
         TODO: How to support dynamic axes? Dimensions are determined by samples
         """
@@ -437,7 +420,7 @@ class GraphExecutionManager(GraphExecutionInterface):
                     f"\n\n{_utils.get_exception_as_string(e)}"
                 ),
             )
-        exported_model = onnx.load_model_from_string(f.getvalue())
+        exported_model: onnx.ModelProto = onnx.load_model_from_string(f.getvalue())
 
         exported_model = _post_process_after_export(
             exported_model, self._enable_custom_autograd_function, self._debug_options.logging.log_level
@@ -456,7 +439,7 @@ class GraphExecutionManager(GraphExecutionInterface):
                     ORTModuleDeviceException, RuntimeError("A device must be specified in the model or inputs!")
                 )
 
-    def _get_graph_transformer_config(self):
+    def _get_graph_transformer_config(self) -> C.TrainingGraphTransformerConfiguration:
         graph_transformer_config = C.TrainingGraphTransformerConfiguration()
         graph_transformer_config.propagate_cast_ops_config = C.PropagateCastOpsConfiguration()
         graph_transformer_config.propagate_cast_ops_config.level = self._propagate_cast_ops_level
@@ -466,7 +449,7 @@ class GraphExecutionManager(GraphExecutionInterface):
         graph_transformer_config.enable_label_sparsity_optimization = self._enable_label_sparsity_optimization
         return graph_transformer_config
 
-    def _initialize_graph_builder(self):
+    def _initialize_graph_builder(self) -> None:
         """Creates a new OrtModuleGraphBuilder, initializes it and saves it to self._graph_builder"""
 
         # All initializer names along with user inputs are a part of the onnx graph inputs

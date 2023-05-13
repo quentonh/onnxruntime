@@ -2,6 +2,10 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
+from typing import Tuple
+
+import torch
+
 from onnxruntime.capi import _pybind_state as C
 
 from . import _utils
@@ -23,7 +27,7 @@ class GradientAccumulationManager:
         self._enabled = False
         self._update_cache = False
 
-    def initialize(self, enabled, module, graph_info) -> None:
+    def initialize(self, enabled, module, graph_info: C.GraphInfo) -> None:
         """Initializes Gradient Accumulation optimization.
 
         Args:
@@ -48,7 +52,9 @@ class GradientAccumulationManager:
         """Indicates whether gradient accumulation optimization is enabled."""
         return self._enabled
 
-    def extract_outputs_and_maybe_update_cache(self, forward_outputs, device):
+    def extract_outputs_and_maybe_update_cache(
+        self, forward_outputs: C.OrtValueVector, device
+    ) -> Tuple[torch.Tensor, ...]:
         """Extract the user outputs from the forward outputs as torch tensor and update cache, if needed
 
         Args:
@@ -64,6 +70,7 @@ class GradientAccumulationManager:
         ort_value_vector.reserve(self._cache_start)
         for i in range(self._cache_start):
             ort_value_vector.push_back(forward_outputs[i])
+
         return _utils._ortvalues_to_torch_tensor(ort_value_vector, device)  # pylint: disable=W0212
 
     def maybe_update_cache_before_run(self):
