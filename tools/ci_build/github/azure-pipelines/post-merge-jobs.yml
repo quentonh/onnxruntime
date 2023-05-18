@@ -8,6 +8,7 @@ variables:
   # The private ADO project
   ${{ if or(startsWith(variables['System.CollectionUri'], 'https://dev.azure.com/aiinfra/'),startsWith(variables['System.CollectionUri'], 'https://aiinfra.visualstudio.com/')) }}:
     value: 'aiinfra-Linux-CPU'
+- template: templates/common-variables.yml
 
 resources:
   repositories:
