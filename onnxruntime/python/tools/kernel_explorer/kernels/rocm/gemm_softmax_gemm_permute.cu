@@ -76,8 +76,12 @@ class IGemmSoftmaxGemmPermuteKernelExplorer : public IKernelExplorer {
     params_.device_prop = &device_prop;
     params_.scale = scale;
 
-    std::tie(params_.q_buffer, params_.k_buffer, params_.v_buffer) = ConvertToOffsetedBufferViews<T>(
-        &attn_, Q.ptr(), K.has_value() ? K->ptr() : nullptr, V.has_value() ? V->ptr() : nullptr);
+    std::tie(params_.q_buffer, params_.k_buffer, params_.v_buffer) =
+        ConvertToOffsetedBufferViews<T>(
+            &attn_,
+            Q.ptr(),
+            K.has_value() ? K->ptr() : nullptr,
+            V.has_value() ? V->ptr() : nullptr);
 
     if (attn_bias.has_value()) {
       params_.bias_buffer = reinterpret_cast<T*>(attn_bias->ptr());

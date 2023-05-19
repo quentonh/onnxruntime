@@ -162,7 +162,7 @@ struct Strides {
   }
 
   template <typename T = longlong4>
-  T ForBNSHCoord() {
+  T ForBNSHCoord() const {
     using E = typename T::value_type;
     return T{static_cast<E>(strides_for_bnsh_coord.x),
              static_cast<E>(strides_for_bnsh_coord.y),
@@ -171,7 +171,7 @@ struct Strides {
   }
 
   template <typename T = longlong4>
-  T ForBSNHCoord() {
+  T ForBSNHCoord() const {
     using E = typename T::value_type;
     return T{static_cast<E>(strides_for_bnsh_coord.x),
              static_cast<E>(strides_for_bnsh_coord.z),
@@ -180,12 +180,17 @@ struct Strides {
   }
 
   template <typename T = longlong4>
-  T ForBNHSCoord() {
+  T ForBNHSCoord() const {
     using E = typename T::value_type;
     return T{static_cast<E>(strides_for_bnsh_coord.x),
              static_cast<E>(strides_for_bnsh_coord.y),
              static_cast<E>(strides_for_bnsh_coord.w),
              static_cast<E>(strides_for_bnsh_coord.z)};
+  }
+
+  int64_t OffsetAt(int b, int n, int s, int h) const {
+    return strides_for_bnsh_coord.x * b + strides_for_bnsh_coord.y * n +
+           strides_for_bnsh_coord.z * s + strides_for_bnsh_coord.w * h;
   }
 
   // store intermediate strides in the canonical (b,n,s,h) coordinate order
@@ -198,25 +203,37 @@ std::tuple<const HipT*, const HipT*, const HipT*> ConvertToOffsetedBufferViews(
     const T* query = nullptr,    // q or packed_qkv
     const T* key = nullptr,      // k or packed kv
     const T* value = nullptr,    //
-    const T* past = nullptr,     // past or past_k
-    const T* past_v = nullptr,   //
     const T* present = nullptr,  // present or present_k
     const T* present_v = nullptr) {
-  ORT_UNUSED_PARAMETER(past_v);
-  ORT_UNUSED_PARAMETER(present_v);
   switch (attn->mode) {
     case QFMT_KFMT_VFMT_NONE_NONE_NONE_NONE: {
       return {reinterpret_cast<const HipT*>(query),
               reinterpret_cast<const HipT*>(key),
               reinterpret_cast<const HipT*>(value)};
     }
+    case QFMT_KFMT_VFMT_NONE_NONE_2BNTH_NONE:
     case QFMT_KFMT_VFMT_2BNPH_NONE_2BNTH_NONE: {
-      auto offset = static_cast<int64_t>(attn->batch_size) * attn->num_head * attn->total_sequence_length *
+      auto offset = static_cast<int64_t>(attn->batch_size) * attn->num_heads * attn->total_sequence_length *
                     attn->head_size;
       return {reinterpret_cast<const HipT*>(query),
               reinterpret_cast<const HipT*>(present),
               reinterpret_cast<const HipT*>(present) + offset};
     }
+    case QFMT_KFMT_VFMT_NONE_NONE_2BNMH_NONE:
+    case QFMT_KFMT_VFMT_2BNMH_NONE_2BNMH_NONE: {
+      auto offset = static_cast<int64_t>(attn->batch_size) * attn->num_heads * attn->max_sequence_length *
+                    attn->head_size;
+      return {reinterpret_cast<const HipT*>(query),
+              reinterpret_cast<const HipT*>(present),
+              reinterpret_cast<const HipT*>(present) + offset};
+    }
+    case BSNH_BLNH_BLNH_BNPH_BNPH_BNTH_BNTH:
+    case BSNH_BNLH_BNLH_BNPH_BNPH_BNTH_BNTH:
+    case BSNH_BLNH_BLNH_BNMH_BNMH_BNMH_BNMH:
+    case BSNH_BNLH_BNLH_BNMH_BNMH_BNMH_BNMH:
+      return {reinterpret_cast<const HipT*>(query),
+              reinterpret_cast<const HipT*>(present),
+              reinterpret_cast<const HipT*>(present_v)};
     case BSNH_BLN2H_NONE_NONE_NONE_NONE_NONE: {
       auto packed_kv = reinterpret_cast<const HipT*>(key);
       return {reinterpret_cast<const HipT*>(query), packed_kv, packed_kv + attn->head_size};
@@ -237,7 +254,8 @@ inline std::tuple<Strides, Strides, Strides> GetQkvStrides(const RocmAttentionPa
   const int& N = attn->num_heads;
   const int& S = attn->sequence_length;
   const int& L = attn->kv_sequence_length;
-  // const int& T = attn->total_sequence_length;
+  const int& T = attn->total_sequence_length;
+  const int& M = attn->max_sequence_length;
   const int& H = attn->head_size;
   const int& Hv = attn->v_head_size;
 
@@ -256,6 +274,21 @@ inline std::tuple<Strides, Strides, Strides> GetQkvStrides(const RocmAttentionPa
             Strides::BSNHMemory(B, N, L, Hv),
         };
       }
+    case BSNH_BLNH_BLNH_BNPH_BNPH_BNTH_BNTH:
+    case BSNH_BNLH_BNLH_BNPH_BNPH_BNTH_BNTH:
+      return {
+          Strides::BSNHMemory(B, N, S, H),
+          Strides::BNSHMemory(B, N, T, H),
+          Strides::BNSHMemory(B, N, T, Hv),
+      };
+    case BSNH_BLNH_BLNH_BNMH_BNMH_BNMH_BNMH:
+    case BSNH_BNLH_BNLH_BNMH_BNMH_BNMH_BNMH:
+      return {
+          Strides::BSNHMemory(B, N, S, H),
+          Strides::BNSHMemory(B, N, M, H),
+          Strides::BNSHMemory(B, N, M, Hv),
+      };
+
     case BSNH_BLN2H_NONE_NONE_NONE_NONE_NONE:
       return {
           Strides::BSNHMemory(B, N, S, H),
@@ -491,6 +524,10 @@ class GemmSoftmaxGemmPermuteTunableOp : public tunable::TunableOp<GemmSoftmaxGem
         if (attn->qkv_format == Q_K_V_BNSH || attn->qkv_format == Q_K_V_BSNH) {
           return true;
         }
+      case BSNH_BLNH_BLNH_BNPH_BNPH_BNTH_BNTH:
+      case BSNH_BNLH_BNLH_BNPH_BNPH_BNTH_BNTH:
+      case BSNH_BLNH_BLNH_BNMH_BNMH_BNMH_BNMH:
+      case BSNH_BNLH_BNLH_BNMH_BNMH_BNMH_BNMH:
       case BSNH_BLN2H_NONE_NONE_NONE_NONE_NONE:
       case BLN3H_NONE_NONE_NONE_NONE_NONE_NONE:
         return true;
